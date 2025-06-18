@@ -9,7 +9,7 @@ services:
       - DATABASE_URL=postgresql://dental_user:dental_pass@db:5432/dental_bot
       - REDIS_URL=redis://redis:6379
       - JWT_SECRET=your-super-secret-jwt-key-for-development
-      - API_KEY=dev-api-key-123
+      - API_KEY=dental-bot-api-key-123456789
     depends_on:
       - db
       - redis
