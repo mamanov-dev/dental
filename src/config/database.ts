@@ -1,6 +1,28 @@
-import { Pool, PoolClient } from 'pg';
-import { DatabaseConfig, QueryResult, Transaction } from '@/types';
+import { Pool, PoolClient, QueryResult as PgQueryResult, QueryResultRow } from 'pg';
 import logger from './logger';
+
+// Локальные интерфейсы для DatabaseService
+interface DatabaseConfig {
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  password: string;
+  ssl?: boolean;
+  maxConnections?: number;
+}
+
+interface QueryResult<T = any> {
+  rows: T[];
+  rowCount: number;
+  command: string;
+}
+
+interface Transaction {
+  query<T extends QueryResultRow = any>(text: string, params?: any[]): Promise<PgQueryResult<T>>;
+  commit(): Promise<PgQueryResult>;
+  rollback(): Promise<PgQueryResult>;
+}
 
 export class DatabaseService {
   private pool: Pool;
@@ -65,12 +87,12 @@ export class DatabaseService {
     });
   }
 
-  async query<T>(text: string, params?: any[]): Promise<QueryResult<T>> {
+  async query<T extends QueryResultRow = any>(text: string, params?: any[]): Promise<QueryResult<T>> {
     const start = Date.now();
     const client = await this.pool.connect();
     
     try {
-      const result = await client.query(text, params);
+      const result = await client.query<T>(text, params);
       const duration = Date.now() - start;
       
       logger.debug('Executed query', { 
@@ -79,7 +101,11 @@ export class DatabaseService {
         rows: result.rowCount 
       });
       
-      return result;
+      return {
+        rows: result.rows,
+        rowCount: result.rowCount || 0,
+        command: result.command
+      };
     } catch (error) {
       logger.error('Database query error:', { text, params, error });
       throw error;
@@ -88,7 +114,7 @@ export class DatabaseService {
     }
   }
 
-  async queryOne<T>(text: string, params?: any[]): Promise<T | null> {
+  async queryOne<T extends QueryResultRow = any>(text: string, params?: any[]): Promise<T | null> {
     const result = await this.query<T>(text, params);
     return result.rows[0] || null;
   }
@@ -100,7 +126,7 @@ export class DatabaseService {
       await client.query('BEGIN');
       
       const transaction: Transaction = {
-        query: <T>(text: string, params?: any[]) => client.query(text, params),
+        query: <U extends QueryResultRow = any>(text: string, params?: any[]) => client.query<U>(text, params),
         commit: () => client.query('COMMIT'),
         rollback: () => client.query('ROLLBACK'),
       };
@@ -133,3 +159,6 @@ export class DatabaseService {
     logger.info('Database connection pool closed');
   }
 }
+
+// Экспортируем типы для использования в других модулях
+export type { DatabaseConfig, QueryResult, Transaction };

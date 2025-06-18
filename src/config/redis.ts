@@ -1,27 +1,22 @@
-import Redis from 'redis';
+import { createClient, RedisClientType } from 'redis';
 import logger from './logger';
 
 export class RedisService {
-  private client: Redis.RedisClientType;
+  private client: RedisClientType;
   private static instance: RedisService;
 
   constructor() {
-    this.client = Redis.createClient({
-      url: process.env.REDIS_URL || 'redis://localhost:6379',
-      retry_strategy: (options) => {
-        if (options.error && options.error.code === 'ECONNREFUSED') {
-          logger.error('Redis server refused connection');
-          return new Error('Redis server refused connection');
+    this.client = createClient({
+      url: process.env.REDIS_URL || 'redis://redis:6379',
+      socket: {
+        reconnectStrategy: (retries: number) => {
+          if (retries > 10) {
+            logger.error('Redis retry attempts exhausted');
+            return new Error('Retry attempts exhausted');
+          }
+          return Math.min(retries * 100, 3000);
         }
-        if (options.total_retry_time > 1000 * 60 * 60) {
-          logger.error('Redis retry time exhausted');
-          return new Error('Retry time exhausted');
-        }
-        if (options.attempt > 10) {
-          return undefined;
-        }
-        return Math.min(options.attempt * 100, 3000);
-      },
+      }
     });
 
     this.setupEventListeners();
@@ -87,7 +82,7 @@ export class RedisService {
   async expire(key: string, seconds: number): Promise<boolean> {
     await this.connect();
     const result = await this.client.expire(key, seconds);
-    return result;
+    return result === 1;
   }
 
   async healthCheck(): Promise<boolean> {

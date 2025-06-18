@@ -6,16 +6,37 @@ import logger from '@/config/logger';
 export class TelegramService {
   private bot: TelegramBot;
   private botEngine: BotEngine;
+  private isPolling: boolean = false;
 
   constructor() {
     const token = process.env.TELEGRAM_BOT_TOKEN;
-    if (!token) {
+    if (!token || token === 'your-telegram-bot-token') {
       throw new Error('Telegram bot token not configured');
     }
 
-    this.bot = new TelegramBot(token, { polling: true });
+    // Создаем бота БЕЗ автоматического polling
+    this.bot = new TelegramBot(token, { polling: false });
     this.botEngine = new BotEngine();
-    this.setupHandlers();
+    
+    // Запускаем polling только если токен реальный
+    this.startPolling();
+  }
+
+  private async startPolling(): Promise<void> {
+    try {
+      // Сначала проверяем токен
+      await this.bot.getMe();
+      
+      // Если токен валидный, запускаем polling
+      await this.bot.startPolling();
+      this.isPolling = true;
+      
+      this.setupHandlers();
+      logger.info('Telegram bot started successfully with polling');
+    } catch (error) {
+      logger.error('Failed to start Telegram polling:', error);
+      // Не выбрасываем ошибку, просто логируем
+    }
   }
 
   private setupHandlers(): void {
@@ -45,7 +66,10 @@ export class TelegramService {
       logger.error('Telegram bot error:', error);
     });
 
-    logger.info('Telegram bot started successfully');
+    // Обработка ошибок polling
+    this.bot.on('polling_error', (error) => {
+      logger.error('Telegram polling error:', error);
+    });
   }
 
   private async processTextMessage(msg: TelegramBot.Message, customText?: string): Promise<void> {
@@ -177,7 +201,7 @@ export class TelegramService {
   async healthCheck(): Promise<boolean> {
     try {
       const me = await this.bot.getMe();
-      logger.info('Telegram bot health check passed', { username: me.username });
+      logger.debug('Telegram bot health check passed', { username: me.username });
       return true;
     } catch (error) {
       logger.error('Telegram health check failed:', error);
@@ -186,7 +210,10 @@ export class TelegramService {
   }
 
   async stop(): Promise<void> {
-    this.bot.stopPolling();
+    if (this.isPolling) {
+      this.bot.stopPolling();
+      this.isPolling = false;
+    }
     logger.info('Telegram bot stopped');
   }
 }

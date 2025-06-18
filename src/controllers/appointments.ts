@@ -1,14 +1,51 @@
 import { Router, Request, Response } from 'express';
 import { DatabaseService } from '@/config/database';
-import { CreateAppointmentDto, UpdateAppointmentDto, APIResponse } from '@/types';
 import { validateAppointment } from '@/middleware/validation';
 import logger from '@/config/logger';
+
+// Локальные интерфейсы для appointments
+interface CreateAppointmentDto {
+  clinicId: number;
+  doctorId: number;
+  patientPhone: string;
+  patientName?: string;
+  appointmentDate: Date;
+  serviceType?: string;
+  notes?: string;
+}
+
+interface UpdateAppointmentDto {
+  appointmentDate?: Date;
+  doctorId?: number;
+  serviceType?: string;
+  notes?: string;
+  status?: string;
+}
+
+interface APIResponse<T = any> {
+  success: boolean;
+  data?: T;
+  error?: {
+    code: string;
+    message: string;
+  };
+  timestamp: Date;
+}
+
+// Расширенный интерфейс Request с пользователем
+interface AuthenticatedRequest extends Request {
+  user?: {
+    id: number;
+    clinicId: number;
+    role: string;
+  };
+}
 
 const router = Router();
 const db = DatabaseService.getInstance();
 
 // Получить все записи клиники
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const clinicId = req.user?.clinicId;
     const { date, status, doctorId } = req.query;
@@ -24,7 +61,7 @@ router.get('/', async (req: Request, res: Response) => {
       JOIN doctors d ON a.doctor_id = d.id
       WHERE a.clinic_id = $1
     `;
-    const params = [clinicId];
+    const params: any[] = [clinicId];
     let paramIndex = 2;
 
     if (date) {
@@ -70,7 +107,7 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 // Получить конкретную запись
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const appointmentId = parseInt(req.params.id);
     const clinicId = req.user?.clinicId;
@@ -89,7 +126,7 @@ router.get('/:id', async (req: Request, res: Response) => {
     `, [appointmentId, clinicId]);
 
     if (!result) {
-      return res.status(404).json({
+      res.status(404).json({
         success: false,
         error: {
           code: 'NOT_FOUND',
@@ -97,6 +134,7 @@ router.get('/:id', async (req: Request, res: Response) => {
         },
         timestamp: new Date()
       });
+      return;
     }
 
     res.json({
@@ -118,7 +156,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 // Создать новую запись
-router.post('/', validateAppointment, async (req: Request, res: Response) => {
+router.post('/', validateAppointment, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const appointmentData: CreateAppointmentDto = req.body;
     const clinicId = req.user?.clinicId;
@@ -130,7 +168,7 @@ router.post('/', validateAppointment, async (req: Request, res: Response) => {
     `, [appointmentData.doctorId, clinicId]);
 
     if (!doctor) {
-      return res.status(400).json({
+      res.status(400).json({
         success: false,
         error: {
           code: 'INVALID_DOCTOR',
@@ -138,15 +176,16 @@ router.post('/', validateAppointment, async (req: Request, res: Response) => {
         },
         timestamp: new Date()
       });
+      return;
     }
 
     // Находим или создаем пациента
-    let patient = await db.queryOne(`
+    let patient = await db.queryOne<{ id: number }>(`
       SELECT id FROM patients WHERE phone = $1
     `, [appointmentData.patientPhone]);
 
     if (!patient) {
-      const patientResult = await db.query(`
+      const patientResult = await db.query<{ id: number }>(`
         INSERT INTO patients (phone, name, platform)
         VALUES ($1, $2, 'api')
         RETURNING id
@@ -196,7 +235,7 @@ router.post('/', validateAppointment, async (req: Request, res: Response) => {
 });
 
 // Обновить запись
-router.put('/:id', async (req: Request, res: Response) => {
+router.put('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const appointmentId = parseInt(req.params.id);
     const updateData: UpdateAppointmentDto = req.body;
@@ -209,7 +248,7 @@ router.put('/:id', async (req: Request, res: Response) => {
     `, [appointmentId, clinicId]);
 
     if (!existing) {
-      return res.status(404).json({
+      res.status(404).json({
         success: false,
         error: {
           code: 'NOT_FOUND',
@@ -217,11 +256,12 @@ router.put('/:id', async (req: Request, res: Response) => {
         },
         timestamp: new Date()
       });
+      return;
     }
 
     // Формируем запрос обновления
-    const updates = [];
-    const params = [];
+    const updates: string[] = [];
+    const params: any[] = [];
     let paramIndex = 1;
 
     if (updateData.appointmentDate) {
@@ -255,7 +295,7 @@ router.put('/:id', async (req: Request, res: Response) => {
     }
 
     if (updates.length === 0) {
-      return res.status(400).json({
+      res.status(400).json({
         success: false,
         error: {
           code: 'NO_UPDATES',
@@ -263,6 +303,7 @@ router.put('/:id', async (req: Request, res: Response) => {
         },
         timestamp: new Date()
       });
+      return;
     }
 
     updates.push(`updated_at = NOW()`);
@@ -301,7 +342,7 @@ router.put('/:id', async (req: Request, res: Response) => {
 });
 
 // Отменить запись
-router.delete('/:id', async (req: Request, res: Response) => {
+router.delete('/:id', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const appointmentId = parseInt(req.params.id);
     const clinicId = req.user?.clinicId;
@@ -314,7 +355,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
     `, [appointmentId, clinicId]);
 
     if (result.rows.length === 0) {
-      return res.status(404).json({
+      res.status(404).json({
         success: false,
         error: {
           code: 'NOT_FOUND',
@@ -322,6 +363,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
         },
         timestamp: new Date()
       });
+      return;
     }
 
     logger.info('Appointment cancelled', { appointmentId });

@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 import { IncomingMessage, BotResponse, ResponseOption } from '@/types';
 import { BotEngine } from '@/bot/BotEngine';
 import logger from '@/config/logger';
@@ -234,8 +234,9 @@ export class WhatsAppService {
         to: message.to
       });
     } catch (error) {
+      const axiosError = error as AxiosError;
       logger.error('Failed to send WhatsApp message:', {
-        error: error.response?.data || error.message,
+        error: axiosError.response?.data || axiosError.message,
         to: message.to
       });
       throw error;

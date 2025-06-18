@@ -7,7 +7,7 @@
     "test": "tests"
   },
   "scripts": {
-    "dev": "nodemon src/server.ts",
+    "dev": "nodemon --exec ts-node -r tsconfig-paths/register src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
     "test": "jest",
@@ -42,6 +42,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
     "helmet": "^8.1.0",
     "joi": "^17.13.3",
     "jsonwebtoken": "^9.0.2",
@@ -50,12 +51,17 @@
     "pg": "^8.16.0",
     "qrcode-terminal": "^0.12.0",
     "redis": "^5.5.6",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
     "typescript": "^5.8.3",
     "whatsapp-web.js": "^1.30.0",
     "winston": "^3.17.0"
   },
   "devDependencies": {
+    "@types/compression": "^1.7.5",
+    "@types/cors": "^2.8.17",
     "@types/jest": "^30.0.0",
+    "@types/morgan": "^1.9.9",
     "@types/supertest": "^6.0.3",
     "@typescript-eslint/eslint-plugin": "^8.34.1",
     "@typescript-eslint/parser": "^8.34.1",
@@ -66,7 +72,6 @@
     "nodemon": "^3.1.10",
     "prettier": "^3.5.3",
     "supertest": "^7.1.1",
-    "ts-jest": "^29.4.0",
-    "ts-node": "^10.9.2"
+    "ts-jest": "^29.4.0"
   }
 }

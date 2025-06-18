@@ -1,3 +1,6 @@
+// Импортируем или определяем тип Platform
+export type Platform = 'whatsapp' | 'telegram' | 'web';
+
 export interface AppointmentEvent {
   type: 'created' | 'updated' | 'cancelled' | 'confirmed' | 'completed' | 'no_show';
   appointmentId: number;

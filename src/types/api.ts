@@ -1,3 +1,14 @@
+// Базовые типы для API
+export type AppointmentStatus = 
+  | 'scheduled' 
+  | 'confirmed' 
+  | 'cancelled' 
+  | 'completed' 
+  | 'no_show' 
+  | 'rescheduled';
+
+export type Platform = 'whatsapp' | 'telegram' | 'web';
+
 export interface APIResponse<T = any> {
   success: boolean;
   data?: T;

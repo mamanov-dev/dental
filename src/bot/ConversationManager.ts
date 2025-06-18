@@ -2,12 +2,51 @@ import {
   ChatSession, 
   BotResponse, 
   Intent, 
-  Clinic, 
-  ConversationFlow,
-  FlowStep 
+  Clinic,
+  ResponseOption
 } from '@/types';
 import { DatabaseService } from '@/config/database';
 import logger from '@/config/logger';
+
+// Локальные интерфейсы для ConversationManager
+interface ValidationRule {
+  type: 'required' | 'phone' | 'date' | 'time' | 'custom';
+  message: string;
+  validator?: (value: string) => boolean;
+}
+
+interface FlowStep {
+  id: string;
+  message: string;
+  type: 'input' | 'selection' | 'confirmation' | 'info';
+  validation?: ValidationRule[];
+  options?: ResponseOption[];
+  nextStep?: string | ((context: any) => string);
+}
+
+interface ConversationFlow {
+  id: string;
+  name: string;
+  steps: FlowStep[];
+  fallbackStep?: string;
+}
+
+// Интерфейс для врача из БД
+interface DoctorRow {
+  id: number;
+  name: string;
+  specialization: string;
+}
+
+// Расширенный интерфейс для данных контекста
+interface BookingData {
+  patientName?: string;
+  patientPhone?: string;
+  serviceType?: string;
+  doctorId?: number;
+  selectedDate?: string;
+  selectedTime?: string;
+}
 
 export class ConversationManager {
   private db: DatabaseService;
@@ -105,7 +144,7 @@ export class ConversationManager {
       };
     }
 
-    const currentStep = flow.steps.find(s => s.id === context.step);
+    const currentStep = flow.steps.find((s: FlowStep) => s.id === context.step);
     if (!currentStep) {
       return {
         type: 'text',
@@ -138,7 +177,7 @@ export class ConversationManager {
   private async executeFlowStep(session: ChatSession, stepId: string, clinic: Clinic): Promise<BotResponse> {
     const context = session.sessionData;
     const flow = this.flows.get(context.flow);
-    const step = flow?.steps.find(s => s.id === stepId);
+    const step = flow?.steps.find((s: FlowStep) => s.id === stepId);
 
     if (!step) {
       return {
@@ -167,11 +206,11 @@ export class ConversationManager {
         };
 
       case 'SELECT_DOCTOR':
-        const doctors = await this.getAvailableDoctors(clinic.id, context.data.serviceType);
+        const doctors = await this.getAvailableDoctors(clinic.id, (context.data as BookingData).serviceType);
         return {
           type: 'keyboard',
           text: step.message,
-          options: doctors.map(d => ({
+          options: doctors.map((d: DoctorRow) => ({
             id: d.id.toString(),
             text: d.name,
             value: d.id.toString(),
@@ -181,7 +220,7 @@ export class ConversationManager {
         };
 
       case 'SELECT_DATE':
-        const dates = await this.getAvailableDates(context.data.doctorId);
+        const dates = await this.getAvailableDates((context.data as BookingData).doctorId || 0);
         return {
           type: 'keyboard',
           text: step.message,
@@ -195,8 +234,8 @@ export class ConversationManager {
 
       case 'SELECT_TIME':
         const times = await this.getAvailableTimes(
-          context.data.doctorId, 
-          context.data.selectedDate
+          (context.data as BookingData).doctorId || 0, 
+          (context.data as BookingData).selectedDate || ''
         );
         return {
           type: 'keyboard',
@@ -251,10 +290,11 @@ export class ConversationManager {
 
   private async saveStepData(session: ChatSession, step: FlowStep, input: string): Promise<void> {
     const context = session.sessionData;
+    const data = context.data as BookingData;
     
     switch (step.id) {
       case 'COLLECT_NAME':
-        context.data.patientName = input.trim();
+        data.patientName = input.trim();
         // Обновляем имя пациента в БД
         await this.db.query(`
           UPDATE patients SET name = $1 WHERE id = $2
@@ -262,23 +302,23 @@ export class ConversationManager {
         break;
 
       case 'COLLECT_PHONE':
-        context.data.patientPhone = input.trim();
+        data.patientPhone = input.trim();
         break;
 
       case 'SELECT_SERVICE':
-        context.data.serviceType = input;
+        data.serviceType = input;
         break;
 
       case 'SELECT_DOCTOR':
-        context.data.doctorId = parseInt(input);
+        data.doctorId = parseInt(input);
         break;
 
       case 'SELECT_DATE':
-        context.data.selectedDate = input;
+        data.selectedDate = input;
         break;
 
       case 'SELECT_TIME':
-        context.data.selectedTime = input;
+        data.selectedTime = input;
         break;
     }
 
@@ -289,25 +329,25 @@ export class ConversationManager {
   }
 
   private getNextStepId(flow: ConversationFlow, currentStep: FlowStep, context: any): string | null {
-    const currentIndex = flow.steps.findIndex(s => s.id === currentStep.id);
+    const currentIndex = flow.steps.findIndex((s: FlowStep) => s.id === currentStep.id);
     const nextStep = flow.steps[currentIndex + 1];
     return nextStep ? nextStep.id : null;
   }
 
-  private async getAvailableDoctors(clinicId: number, serviceType?: string): Promise<any[]> {
+  private async getAvailableDoctors(clinicId: number, serviceType?: string): Promise<DoctorRow[]> {
     let query = `
       SELECT id, name, specialization 
       FROM doctors 
       WHERE clinic_id = $1 AND is_active = true
     `;
-    const params = [clinicId];
+    const params: any[] = [clinicId];
 
     if (serviceType) {
       query += ` AND services::jsonb ? $2`;
       params.push(serviceType);
     }
 
-    const result = await this.db.query(query, params);
+    const result = await this.db.query<DoctorRow>(query, params);
     return result.rows;
   }
 
@@ -331,7 +371,8 @@ export class ConversationManager {
   }
 
   private generateConfirmationMessage(context: any, clinic: Clinic): BotResponse {
-    const { patientName, serviceType, doctorId, selectedDate, selectedTime } = context.data;
+    const data = context.data as BookingData;
+    const { patientName, serviceType, selectedDate, selectedTime } = data;
     
     return {
       type: 'keyboard',
@@ -339,7 +380,7 @@ export class ConversationManager {
             `👤 Пациент: ${patientName}\n` +
             `🏥 Клиника: ${clinic.name}\n` +
             `🦷 Услуга: ${serviceType}\n` +
-            `📅 Дата: ${this.formatDateOption(selectedDate)}\n` +
+            `📅 Дата: ${this.formatDateOption(selectedDate || '')}\n` +
             `⏰ Время: ${selectedTime}\n\n` +
             `Все верно?`,
       options: [
@@ -352,13 +393,14 @@ export class ConversationManager {
 
   private async completeBooking(session: ChatSession, clinic: Clinic): Promise<BotResponse> {
     const context = session.sessionData;
-    const { doctorId, selectedDate, selectedTime, serviceType } = context.data;
+    const data = context.data as BookingData;
+    const { doctorId, selectedDate, selectedTime, serviceType } = data;
 
     try {
       // Создаем запись в БД
       const appointmentDate = new Date(`${selectedDate}T${selectedTime}:00`);
       
-      const result = await this.db.query(`
+      const result = await this.db.query<{ id: number }>(`
         INSERT INTO appointments (
           clinic_id, doctor_id, patient_id, appointment_date, 
           service_type, status, confirmed
@@ -376,8 +418,8 @@ export class ConversationManager {
       const appointmentId = result.rows[0].id;
 
       // Сбрасываем контекст сессии
-      context.flow = null;
-      context.step = null;
+      context.flow = '';
+      context.step = '';
       context.data = {};
 
       await this.db.query(`
@@ -388,7 +430,7 @@ export class ConversationManager {
         type: 'text',
         text: `✅ Запись успешно создана!\n\n` +
               `📋 Номер записи: ${appointmentId}\n` +
-              `📅 Дата: ${this.formatDateOption(selectedDate)} в ${selectedTime}\n\n` +
+              `📅 Дата: ${this.formatDateOption(selectedDate || '')} в ${selectedTime}\n\n` +
               `Мы отправим вам напоминание за день до приема.\n` +
               `Если планы изменятся, сообщите нам заранее.`
       };
@@ -403,6 +445,8 @@ export class ConversationManager {
   }
 
   private formatDateOption(dateString: string): string {
+    if (!dateString) return 'Дата не указана';
+    
     const date = new Date(dateString);
     return new Intl.DateTimeFormat('ru-RU', {
       weekday: 'long',
