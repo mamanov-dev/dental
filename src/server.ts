@@ -114,11 +114,8 @@ class Server {
       parameterLimit: 100
     }));
 
-    // Raw body для webhook'ов
-    this.app.use('/webhook', express.raw({ 
-      type: 'application/json',
-      limit: '5mb' 
-    }));
+    // Raw body для webhook'ов - ИСПРАВЛЕНО: убрали проблемный middleware
+    this.app.use('/webhook', express.json({ limit: '5mb' }));
 
     // Rate limiting только для API routes
     this.app.use('/api/', rateLimiter);
@@ -188,8 +185,8 @@ class Server {
     // Webhook routes (без rate limiting для входящих сообщений)
     this.app.use('/webhook', webhookRoutes);
 
-    // 404 handler - должен быть последним обработчиком маршрутов
-    this.app.all('*', (req: express.Request, res: express.Response): void => {
+    // 404 handler - ИСПРАВЛЕНО: заменили app.all('*') на конкретные методы
+    this.app.use((req: express.Request, res: express.Response): void => {
       res.status(404).json({
         success: false,
         error: {
