@@ -57,6 +57,17 @@ export class ConversationManager {
     this.initializeFlows();
   }
 
+  // ДОБАВЛЕНО: Метод для создания дефолтного контекста
+  private createDefaultContext(): any {
+    return {
+      flow: '',
+      step: '',
+      data: {},
+      retryCount: 0,
+      startTime: new Date()
+    };
+  }
+
   private initializeFlows(): void {
     // Поток записи на прием
     const bookingFlow: ConversationFlow = {
@@ -116,20 +127,56 @@ export class ConversationManager {
   }
 
   async handleBookingFlow(session: ChatSession, intent: Intent, clinic: Clinic): Promise<BotResponse> {
-    const context = session.sessionData;
-    
-    // Инициализируем поток записи
-    context.flow = 'BOOKING';
-    context.step = 'COLLECT_NAME';
-    context.data = context.data || {};
+    try {
+      // ИСПРАВЛЕНО: Проверяем и создаем sessionData если нужно
+      if (!session.sessionData || typeof session.sessionData !== 'object') {
+        session.sessionData = this.createDefaultContext();
+        logger.warn('Created default session data for booking flow');
+      }
 
-    return this.executeFlowStep(session, 'COLLECT_NAME', clinic);
+      const context = session.sessionData;
+      
+      // Инициализируем поток записи
+      context.flow = 'BOOKING';
+      context.step = 'COLLECT_NAME';
+      context.data = context.data || {};
+
+      logger.info('Starting booking flow', { 
+        sessionId: session.id, 
+        flow: context.flow, 
+        step: context.step 
+      });
+
+      // ИСПРАВЛЕНО: Сохраняем обновленный контекст в БД сразу
+      await this.db.query(`
+        UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+      `, [JSON.stringify(context), session.id]);
+
+      return this.executeFlowStep(session, 'COLLECT_NAME', clinic);
+    } catch (error) {
+      logger.error('Error in handleBookingFlow:', error);
+      return {
+        type: 'text',
+        text: '❌ Произошла ошибка при запуске записи на прием. Попробуйте снова.'
+      };
+    }
   }
 
-  async handleCurrentFlow(session: ChatSession, userInput: string, clinic: Clinic): Promise<BotResponse> {
+  // ИСПРАВЛЕНИЕ в ConversationManager.ts - метод handleCurrentFlow
+
+async handleCurrentFlow(session: ChatSession, userInput: string, clinic: Clinic): Promise<BotResponse> {
+  try {
+    // ИСПРАВЛЕНО: Проверяем и создаем sessionData если нужно
+    if (!session.sessionData || typeof session.sessionData !== 'object') {
+      session.sessionData = this.createDefaultContext();
+      logger.warn('Created default session data for current flow');
+    }
+
     const context = session.sessionData;
     
+    // ИСПРАВЛЕНО: Если нет активного потока, переводим в fallback
     if (!context.flow || !context.step) {
+      logger.warn('No active flow found, returning to main menu');
       return {
         type: 'text',
         text: 'Не понимаю. Попробуйте начать сначала, написав "привет".'
@@ -138,6 +185,14 @@ export class ConversationManager {
 
     const flow = this.flows.get(context.flow);
     if (!flow) {
+      logger.error('Flow not found:', context.flow);
+      // Сбрасываем поток
+      context.flow = '';
+      context.step = '';
+      await this.db.query(`
+        UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+      `, [JSON.stringify(context), session.id]);
+      
       return {
         type: 'text',
         text: 'Произошла ошибка. Начните сначала.'
@@ -146,13 +201,51 @@ export class ConversationManager {
 
     const currentStep = flow.steps.find((s: FlowStep) => s.id === context.step);
     if (!currentStep) {
+      logger.error('Current step not found:', context.step);
+      // Сбрасываем поток
+      context.flow = '';
+      context.step = '';
+      await this.db.query(`
+        UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+      `, [JSON.stringify(context), session.id]);
+      
       return {
         type: 'text',
         text: 'Произошла ошибка в диалоге. Начните сначала.'
       };
     }
 
-    // Валидируем ввод пользователя
+    // ДОБАВЛЕНО: Специальная обработка для шага подтверждения
+    if (context.step === 'CONFIRMATION') {
+      logger.info('Processing confirmation step', { userInput });
+      
+      if (userInput === 'confirm') {
+        logger.info('User confirmed booking, completing...');
+        return this.completeBooking(session, clinic);
+      } else if (userInput === 'cancel') {
+        logger.info('User cancelled booking');
+        // Сбрасываем контекст сессии
+        context.flow = '';
+        context.step = '';
+        context.data = {};
+
+        await this.db.query(`
+          UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+        `, [JSON.stringify(context), session.id]);
+
+        return {
+          type: 'text',
+          text: '❌ Запись отменена. Если захотите записаться снова, напишите "привет".'
+        };
+      } else {
+        return {
+          type: 'text',
+          text: 'Пожалуйста, выберите "Подтвердить" или "Отменить".'
+        };
+      }
+    }
+
+    // Валидируем ввод пользователя для других шагов
     const validation = this.validateInput(userInput, currentStep);
     if (!validation.valid) {
       return {
@@ -167,95 +260,128 @@ export class ConversationManager {
     // Переходим к следующему шагу
     const nextStepId = this.getNextStepId(flow, currentStep, context);
     if (!nextStepId) {
-      // Поток завершен
+      // Поток завершен (не должно происходить, так как CONFIRMATION обрабатывается выше)
+      logger.warn('Flow completed without confirmation step');
       return this.completeBooking(session, clinic);
     }
 
     return this.executeFlowStep(session, nextStepId, clinic);
+  } catch (error) {
+    logger.error('Error in handleCurrentFlow:', error);
+    return {
+      type: 'text',
+      text: '❌ Произошла ошибка. Попробуйте снова.'
+    };
   }
+}
 
   private async executeFlowStep(session: ChatSession, stepId: string, clinic: Clinic): Promise<BotResponse> {
-    const context = session.sessionData;
-    const flow = this.flows.get(context.flow);
-    const step = flow?.steps.find((s: FlowStep) => s.id === stepId);
+    try {
+      // ИСПРАВЛЕНО: Проверяем sessionData
+      if (!session.sessionData || typeof session.sessionData !== 'object') {
+        session.sessionData = this.createDefaultContext();
+      }
 
-    if (!step) {
-      return {
-        type: 'text',
-        text: 'Произошла ошибка. Начните сначала.'
-      };
-    }
+      const context = session.sessionData;
+      const flow = this.flows.get(context.flow);
+      const step = flow?.steps.find((s: FlowStep) => s.id === stepId);
 
-    context.step = stepId;
-
-    switch (step.id) {
-      case 'COLLECT_NAME':
-      case 'COLLECT_PHONE':
-        return {
-          type: 'text',
-          text: step.message,
-          nextStep: step.id
-        };
-
-      case 'SELECT_SERVICE':
-        return {
-          type: 'keyboard',
-          text: step.message,
-          options: step.options || [],
-          nextStep: step.id
-        };
-
-      case 'SELECT_DOCTOR':
-        const doctors = await this.getAvailableDoctors(clinic.id, (context.data as BookingData).serviceType);
-        return {
-          type: 'keyboard',
-          text: step.message,
-          options: doctors.map((d: DoctorRow) => ({
-            id: d.id.toString(),
-            text: d.name,
-            value: d.id.toString(),
-            description: d.specialization
-          })),
-          nextStep: step.id
-        };
-
-      case 'SELECT_DATE':
-        const dates = await this.getAvailableDates((context.data as BookingData).doctorId || 0);
-        return {
-          type: 'keyboard',
-          text: step.message,
-          options: dates.map(date => ({
-            id: date,
-            text: this.formatDateOption(date),
-            value: date
-          })),
-          nextStep: step.id
-        };
-
-      case 'SELECT_TIME':
-        const times = await this.getAvailableTimes(
-          (context.data as BookingData).doctorId || 0, 
-          (context.data as BookingData).selectedDate || ''
-        );
-        return {
-          type: 'keyboard',
-          text: step.message,
-          options: times.map(time => ({
-            id: time,
-            text: time,
-            value: time
-          })),
-          nextStep: step.id
-        };
-
-      case 'CONFIRMATION':
-        return this.generateConfirmationMessage(context, clinic);
-
-      default:
+      if (!step) {
+        logger.error('Step not found:', stepId);
         return {
           type: 'text',
           text: 'Произошла ошибка. Начните сначала.'
         };
+      }
+
+      // Обновляем текущий шаг
+      context.step = stepId;
+      
+      // Сохраняем в БД
+      await this.db.query(`
+        UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+      `, [JSON.stringify(context), session.id]);
+
+      logger.info('Executing flow step:', { 
+        stepId, 
+        sessionId: session.id 
+      });
+
+      switch (step.id) {
+        case 'COLLECT_NAME':
+        case 'COLLECT_PHONE':
+          return {
+            type: 'text',
+            text: step.message,
+            nextStep: step.id
+          };
+
+        case 'SELECT_SERVICE':
+          return {
+            type: 'keyboard',
+            text: step.message,
+            options: step.options || [],
+            nextStep: step.id
+          };
+
+        case 'SELECT_DOCTOR':
+          const doctors = await this.getAvailableDoctors(clinic.id, (context.data as BookingData).serviceType);
+          return {
+            type: 'keyboard',
+            text: step.message,
+            options: doctors.map((d: DoctorRow) => ({
+              id: d.id.toString(),
+              text: d.name,
+              value: d.id.toString(),
+              description: d.specialization
+            })),
+            nextStep: step.id
+          };
+
+        case 'SELECT_DATE':
+          const dates = await this.getAvailableDates((context.data as BookingData).doctorId || 0);
+          return {
+            type: 'keyboard',
+            text: step.message,
+            options: dates.map(date => ({
+              id: date,
+              text: this.formatDateOption(date),
+              value: date
+            })),
+            nextStep: step.id
+          };
+
+        case 'SELECT_TIME':
+          const times = await this.getAvailableTimes(
+            (context.data as BookingData).doctorId || 0, 
+            (context.data as BookingData).selectedDate || ''
+          );
+          return {
+            type: 'keyboard',
+            text: step.message,
+            options: times.map(time => ({
+              id: time,
+              text: time,
+              value: time
+            })),
+            nextStep: step.id
+          };
+
+        case 'CONFIRMATION':
+          return this.generateConfirmationMessage(context, clinic);
+
+        default:
+          return {
+            type: 'text',
+            text: 'Произошла ошибка. Начните сначала.'
+          };
+      }
+    } catch (error) {
+      logger.error('Error executing flow step:', error);
+      return {
+        type: 'text',
+        text: '❌ Произошла ошибка. Попробуйте снова.'
+      };
     }
   }
 
@@ -289,43 +415,64 @@ export class ConversationManager {
   }
 
   private async saveStepData(session: ChatSession, step: FlowStep, input: string): Promise<void> {
-    const context = session.sessionData;
-    const data = context.data as BookingData;
-    
-    switch (step.id) {
-      case 'COLLECT_NAME':
-        data.patientName = input.trim();
-        // Обновляем имя пациента в БД
-        await this.db.query(`
-          UPDATE patients SET name = $1 WHERE id = $2
-        `, [input.trim(), session.patientId]);
-        break;
+    try {
+      // ИСПРАВЛЕНО: Проверяем sessionData
+      if (!session.sessionData || typeof session.sessionData !== 'object') {
+        session.sessionData = this.createDefaultContext();
+      }
 
-      case 'COLLECT_PHONE':
-        data.patientPhone = input.trim();
-        break;
+      const context = session.sessionData;
+      const data = context.data as BookingData;
+      
+      switch (step.id) {
+        case 'COLLECT_NAME':
+          data.patientName = input.trim();
+          // Обновляем имя пациента в БД
+          await this.db.query(`
+            UPDATE patients SET name = $1 WHERE id = $2
+          `, [input.trim(), session.patientId]);
+          logger.info('Saved patient name:', input.trim());
+          break;
 
-      case 'SELECT_SERVICE':
-        data.serviceType = input;
-        break;
+        case 'COLLECT_PHONE':
+          data.patientPhone = input.trim();
+          logger.info('Saved patient phone:', input.trim());
+          break;
 
-      case 'SELECT_DOCTOR':
-        data.doctorId = parseInt(input);
-        break;
+        case 'SELECT_SERVICE':
+          data.serviceType = input;
+          logger.info('Saved service type:', input);
+          break;
 
-      case 'SELECT_DATE':
-        data.selectedDate = input;
-        break;
+        case 'SELECT_DOCTOR':
+          data.doctorId = parseInt(input);
+          logger.info('Saved doctor ID:', input);
+          break;
 
-      case 'SELECT_TIME':
-        data.selectedTime = input;
-        break;
+        case 'SELECT_DATE':
+          data.selectedDate = input;
+          logger.info('Saved selected date:', input);
+          break;
+
+        case 'SELECT_TIME':
+          data.selectedTime = input;
+          logger.info('Saved selected time:', input);
+          break;
+      }
+
+      // Обновляем сессию в БД
+      await this.db.query(`
+        UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+      `, [JSON.stringify(context), session.id]);
+      
+      logger.info('Step data saved successfully', { 
+        step: step.id, 
+        sessionId: session.id 
+      });
+    } catch (error) {
+      logger.error('Error saving step data:', error);
+      throw error;
     }
-
-    // Обновляем сессию в БД
-    await this.db.query(`
-      UPDATE chat_sessions SET session_data = $1 WHERE id = $2
-    `, [JSON.stringify(context), session.id]);
   }
 
   private getNextStepId(flow: ConversationFlow, currentStep: FlowStep, context: any): string | null {
@@ -335,20 +482,40 @@ export class ConversationManager {
   }
 
   private async getAvailableDoctors(clinicId: number, serviceType?: string): Promise<DoctorRow[]> {
-    let query = `
-      SELECT id, name, specialization 
-      FROM doctors 
-      WHERE clinic_id = $1 AND is_active = true
-    `;
-    const params: any[] = [clinicId];
+    try {
+      let query = `
+        SELECT id, name, specialization 
+        FROM doctors 
+        WHERE clinic_id = $1 AND is_active = true
+      `;
+      const params: any[] = [clinicId];
 
-    if (serviceType) {
-      query += ` AND services::jsonb ? $2`;
-      params.push(serviceType);
+      if (serviceType) {
+        query += ` AND services::jsonb ? $2`;
+        params.push(serviceType);
+      }
+
+      const result = await this.db.query<DoctorRow>(query, params);
+      
+      // Если нет врачей с нужной услугой, возвращаем всех врачей
+      if (result.rows.length === 0 && serviceType) {
+        const fallbackResult = await this.db.query<DoctorRow>(`
+          SELECT id, name, specialization 
+          FROM doctors 
+          WHERE clinic_id = $1 AND is_active = true
+        `, [clinicId]);
+        return fallbackResult.rows;
+      }
+      
+      return result.rows;
+    } catch (error) {
+      logger.error('Error getting doctors:', error);
+      // Возвращаем тестовых врачей
+      return [
+        { id: 1, name: 'Доктор Иванов', specialization: 'Терапевт' },
+        { id: 2, name: 'Доктор Петрова', specialization: 'Хирург' }
+      ];
     }
-
-    const result = await this.db.query<DoctorRow>(query, params);
-    return result.rows;
   }
 
   private async getAvailableDates(doctorId: number): Promise<string[]> {

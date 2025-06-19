@@ -42,6 +42,17 @@ export class BotEngine {
     this.nlpService = new NLPService();
   }
 
+  // ДОБАВЛЕНО: Метод для создания дефолтного контекста сессии
+  private createDefaultSessionData(): ConversationContext {
+    return {
+      flow: '',
+      step: '',
+      data: {},
+      retryCount: 0,
+      startTime: new Date()
+    };
+  }
+
   async processMessage(message: IncomingMessage): Promise<BotResponse> {
     try {
       logger.info('Processing message', { 
@@ -52,12 +63,16 @@ export class BotEngine {
 
       // 1. Получаем или создаем сессию
       const session = await this.getOrCreateSession(message);
+      logger.info('Session created/found', { sessionId: session.id, clinicId: session.clinicId });
       
       // 2. Получаем контекст клиники
       const clinic = await this.getClinic(session.clinicId);
       if (!clinic) {
+        logger.error('Clinic not found', { clinicId: session.clinicId });
         return this.createErrorResponse('Клиника не найдена');
       }
+      
+      logger.info('Clinic found', { clinicName: clinic.name, clinicId: clinic.id });
 
       // 3. Проверяем rate limiting
       await this.checkRateLimit(message.chatId);
@@ -66,8 +81,46 @@ export class BotEngine {
       const intent = await this.nlpService.detectIntent(
         message.text, 
         session.sessionData,
-        clinic.settings.languages?.[0] || 'ru'
+        clinic.settings?.languages?.[0] || 'ru'
       );
+
+      logger.info('Intent detected', { intent: intent.name, confidence: intent.confidence });
+
+      // ИСПРАВЛЕНО: Если это приветствие или первое сообщение, форсируем GREETING
+      if (intent.name === 'GREETING' || 
+          message.text.toLowerCase().includes('привет') ||
+          message.text.toLowerCase().includes('hello') ||
+          message.text.toLowerCase().includes('start')) {
+        intent.name = 'GREETING';
+        intent.confidence = 0.95;
+        logger.info('Forced greeting intent');
+      }
+
+      // ДОБАВЛЕНО: Обработка кнопок
+      if (message.isButton || message.buttonData) {
+        const buttonValue = message.buttonData || message.text;
+        logger.info('Processing button click', { buttonValue });
+        
+        switch (buttonValue) {
+          case 'book_appointment':
+            intent.name = 'BOOK_APPOINTMENT';
+            intent.confidence = 0.99;
+            break;
+          case 'clinic_info':
+          case 'services_info':
+          case 'contact_info':
+            intent.name = 'GET_INFO';
+            intent.confidence = 0.99;
+            break;
+          case 'lang_ru':
+          case 'lang_kz':
+          case 'lang_en':
+            intent.name = 'CHANGE_LANGUAGE';
+            intent.confidence = 0.99;
+            break;
+        }
+        logger.info('Button intent detected', { intent: intent.name });
+      }
 
       // 5. Обрабатываем намерение
       const response = await this.handleIntent(intent, session, message, clinic);
@@ -79,6 +132,7 @@ export class BotEngine {
       await this.logMessage(session.id, 'incoming', message.text);
       await this.logMessage(session.id, 'outgoing', response.text);
 
+      logger.info('Message processed successfully', { responseType: response.type });
       return response;
 
     } catch (error) {
@@ -89,29 +143,84 @@ export class BotEngine {
 
   private async getOrCreateSession(message: IncomingMessage): Promise<ChatSession> {
     try {
-      // Сначала ищем пациента по номеру телефона или chat_id
+      logger.info('Getting or creating session', { chatId: message.chatId, platform: message.platform });
+      
+      // Сначала ищем пациента
       let patient = await this.findPatient(message);
       
       if (!patient) {
-        // Создаем нового пациента
+        logger.info('Patient not found, creating new patient');
         patient = await this.createPatient(message);
+        logger.info('Patient created', { patientId: patient.id });
+      } else {
+        logger.info('Patient found', { patientId: patient.id });
       }
 
       // Ищем активную сессию
-      const existingSession = await this.db.queryOne<ChatSession>(`
+      const existingSession = await this.db.queryOne<any>(`
         SELECT * FROM chat_sessions 
         WHERE patient_id = $1 AND platform = $2 AND is_active = true
         ORDER BY last_activity DESC LIMIT 1
       `, [patient.id, message.platform]);
 
       if (existingSession) {
-        return existingSession;
+        logger.info('Found existing session', { 
+          sessionId: existingSession.id, 
+          clinicId: existingSession.clinic_id 
+        });
+        
+        // ИСПРАВЛЕНИЕ: Убеждаемся что clinic_id есть
+        if (!existingSession.clinic_id) {
+          logger.warn('Session missing clinic_id, updating...');
+          const defaultClinicId = await this.determineClinic(message);
+          
+          await this.db.query(`
+            UPDATE chat_sessions 
+            SET clinic_id = $1 
+            WHERE id = $2
+          `, [defaultClinicId, existingSession.id]);
+          
+          existingSession.clinic_id = defaultClinicId;
+          logger.info('Updated session with clinic_id', { 
+            sessionId: existingSession.id, 
+            clinicId: defaultClinicId 
+          });
+        }
+
+        // ИСПРАВЛЕНИЕ: Правильно парсим session_data
+        let sessionData;
+        try {
+          if (typeof existingSession.session_data === 'string') {
+            sessionData = JSON.parse(existingSession.session_data);
+          } else if (existingSession.session_data && typeof existingSession.session_data === 'object') {
+            sessionData = existingSession.session_data;
+          } else {
+            sessionData = this.createDefaultSessionData();
+          }
+        } catch (error) {
+          logger.warn('Failed to parse session_data, using default');
+          sessionData = this.createDefaultSessionData();
+        }
+        
+        // ИСПРАВЛЕНИЕ: Возвращаем правильную структуру
+        return {
+          id: existingSession.id,
+          patientId: existingSession.patient_id,
+          clinicId: existingSession.clinic_id,
+          platform: existingSession.platform,
+          sessionData: sessionData,
+          lastActivity: existingSession.last_activity,
+          isActive: existingSession.is_active
+        };
       }
 
       // Создаем новую сессию
       const clinicId = await this.determineClinic(message);
+      logger.info('Determined clinic', { clinicId });
       
-      const result = await this.db.query<ChatSession>(`
+      const defaultSessionData = this.createDefaultSessionData();
+      
+      const result = await this.db.query<any>(`
         INSERT INTO chat_sessions (patient_id, clinic_id, platform, session_data, is_active, last_activity)
         VALUES ($1, $2, $3, $4, $5, NOW())
         RETURNING *
@@ -119,13 +228,7 @@ export class BotEngine {
         patient.id,
         clinicId,
         message.platform,
-        JSON.stringify({
-          flow: 'GREETING',
-          step: 'START',
-          data: {},
-          retryCount: 0,
-          startTime: new Date()
-        }),
+        JSON.stringify(defaultSessionData),
         true
       ]);
 
@@ -133,7 +236,18 @@ export class BotEngine {
         throw new Error('Failed to create chat session');
       }
 
-      return result.rows[0];
+      const newSession = result.rows[0];
+      logger.info('New session created', { sessionId: newSession.id });
+      
+      return {
+        id: newSession.id,
+        patientId: newSession.patient_id,
+        clinicId: newSession.clinic_id,
+        platform: newSession.platform,
+        sessionData: defaultSessionData,
+        lastActivity: newSession.last_activity,
+        isActive: newSession.is_active
+      };
     } catch (error) {
       logger.error('Error in getOrCreateSession:', error);
       throw error;
@@ -185,16 +299,30 @@ export class BotEngine {
 
   private async determineClinic(message: IncomingMessage): Promise<number> {
     try {
+      logger.info('Determining clinic for message');
+      
       // В MVP предполагаем одну клинику
-      // В будущем можно определять по контексту сообщения или настройкам бота
       const clinic = await this.db.queryOne<{ id: number }>(`
         SELECT id FROM clinics WHERE is_active = true LIMIT 1
       `);
 
       if (!clinic) {
-        throw new Error('No active clinic found');
+        logger.error('No active clinic found, trying fallback');
+        
+        // Попробуем найти любую клинику для fallback
+        const anyClinic = await this.db.queryOne<{ id: number }>(`
+          SELECT id FROM clinics LIMIT 1
+        `);
+        
+        if (!anyClinic) {
+          throw new Error('No clinics found at all');
+        }
+        
+        logger.warn('Using fallback clinic', { clinicId: anyClinic.id });
+        return anyClinic.id;
       }
 
+      logger.info('Found active clinic', { clinicId: clinic.id });
       return clinic.id;
     } catch (error) {
       logger.error('Error determining clinic:', error);
@@ -204,22 +332,48 @@ export class BotEngine {
 
   private async getClinic(clinicId: number): Promise<Clinic | null> {
     try {
-      // Проверяем кеш
-      const cacheKey = `clinic:${clinicId}`;
-      const cached = await this.redis.get(cacheKey);
+      logger.info('Getting clinic', { clinicId });
       
-      if (cached) {
-        return JSON.parse(cached) as Clinic;
+      // ИСПРАВЛЕНО: Добавляем проверку что clinicId передан
+      if (!clinicId || isNaN(clinicId)) {
+        logger.error('Invalid clinicId provided to getClinic', { clinicId });
+        return null;
       }
 
-      // Загружаем из БД
+      // Проверяем кеш
+      const cacheKey = `clinic:${clinicId}`;
+      
+      try {
+        const cached = await this.redis.get(cacheKey);
+        if (cached) {
+          logger.info('Clinic found in cache');
+          return JSON.parse(cached) as Clinic;
+        }
+      } catch (redisError) {
+        logger.warn('Redis cache error, continuing without cache:', redisError);
+      }
+
       const clinic = await this.db.queryOne<Clinic>(`
-        SELECT * FROM clinics WHERE id = $1 AND is_active = true
+        SELECT * FROM clinics WHERE id = $1
       `, [clinicId]);
 
+      logger.info('Clinic query result', { 
+        found: !!clinic, 
+        clinicId,
+        clinicName: clinic?.name 
+      });
+
       if (clinic) {
-        // Кешируем на 30 минут
-        await this.redis.set(cacheKey, JSON.stringify(clinic), 1800);
+        // Кешируем на 30 минут (только если Redis работает)
+        try {
+          await this.redis.set(cacheKey, JSON.stringify(clinic), 1800);
+          logger.info('Clinic cached successfully', { clinicName: clinic.name });
+        } catch (redisError) {
+          logger.warn('Failed to cache clinic, continuing:', redisError);
+        }
+        return clinic;
+      } else {
+        logger.error('No clinic found with id', { clinicId });
       }
 
       return clinic;
@@ -229,53 +383,108 @@ export class BotEngine {
     }
   }
 
-  private async handleIntent(
-    intent: Intent, 
-    session: ChatSession, 
-    message: IncomingMessage,
-    clinic: Clinic
-  ): Promise<BotResponse> {
-    
-    try {
-      logger.info('Handling intent', { 
-        intent: intent.name, 
-        confidence: intent.confidence,
-        sessionId: session.id 
-      });
+  // ИСПРАВЛЕНИЕ в BotEngine.ts - метод handleIntent
 
-      switch (intent.name) {
-        case 'GREETING':
-          return await this.handleGreeting(session, clinic);
-        
-        case 'BOOK_APPOINTMENT':
-          return await this.conversationManager.handleBookingFlow(session, intent, clinic);
-        
-        case 'CANCEL_APPOINTMENT':
-          return await this.handleCancellation(session, intent);
-        
-        case 'CONFIRM_APPOINTMENT':
-          return await this.handleConfirmation(session, intent);
-        
-        case 'GET_INFO':
-          return await this.handleInfoRequest(session, intent, clinic);
-        
-        case 'CHANGE_LANGUAGE':
-          return await this.handleLanguageChange(session, intent);
-        
-        case 'FALLBACK':
-          return await this.handleFallback(session, message.text);
-        
-        default:
-          return await this.conversationManager.handleCurrentFlow(session, message.text, clinic);
-      }
-    } catch (error) {
-      logger.error('Error handling intent:', error);
-      return this.createErrorResponse('Не удалось обработать ваш запрос. Попробуйте еще раз.');
+private async handleIntent(
+  intent: Intent, 
+  session: ChatSession, 
+  message: IncomingMessage,
+  clinic: Clinic
+): Promise<BotResponse> {
+  
+  try {
+    logger.info('Handling intent', { 
+      intent: intent.name, 
+      confidence: intent.confidence,
+      sessionId: session.id 
+    });
+
+    // ИСПРАВЛЕНИЕ: Убеждаемся что sessionData существует
+    if (!session.sessionData || typeof session.sessionData !== 'object') {
+      session.sessionData = this.createDefaultSessionData();
+      logger.warn('Reset session data to default');
     }
+
+    // ДОБАВЛЕНО: Обработка кнопок подтверждения в процессе записи
+    if (message.isButton || message.buttonData) {
+      const buttonValue = message.buttonData || message.text;
+      logger.info('Processing button in intent handler', { buttonValue });
+      
+      // Если пользователь в потоке записи и нажал подтвердить
+      if (session.sessionData?.flow === 'BOOKING' && 
+          session.sessionData?.step === 'CONFIRMATION' &&
+          buttonValue === 'confirm') {
+        logger.info('User confirming booking in active flow');
+        return await this.conversationManager.handleCurrentFlow(session, buttonValue, clinic);
+      }
+      
+      // Если пользователь отменяет запись
+      if (session.sessionData?.flow === 'BOOKING' && 
+          session.sessionData?.step === 'CONFIRMATION' &&
+          buttonValue === 'cancel') {
+        logger.info('User cancelling booking in active flow');
+        // Сбрасываем поток
+        session.sessionData.flow = '';
+        session.sessionData.step = '';
+        session.sessionData.data = {};
+        
+        await this.db.query(`
+          UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+        `, [JSON.stringify(session.sessionData), session.id]);
+        
+        return {
+          type: 'text',
+          text: '❌ Запись отменена. Если захотите записаться снова, напишите "привет".'
+        };
+      }
+    }
+
+    switch (intent.name) {
+      case 'GREETING':
+        return await this.handleGreeting(session, clinic);
+      
+      case 'BOOK_APPOINTMENT':
+        return await this.conversationManager.handleBookingFlow(session, intent, clinic);
+      
+      case 'CANCEL_APPOINTMENT':
+        return await this.handleCancellation(session, intent);
+      
+      case 'CONFIRM_APPOINTMENT':
+        // ИСПРАВЛЕНО: Только для подтверждения существующих записей, НЕ для завершения бронирования
+        return await this.handleConfirmation(session, intent);
+      
+      case 'GET_INFO':
+        return await this.handleInfoRequest(session, intent, clinic, message);
+      
+      case 'CHANGE_LANGUAGE':
+        return await this.handleLanguageChange(session, intent);
+      
+      case 'FALLBACK':
+      case 'UNKNOWN':
+        // ИСПРАВЛЕНО: Проверяем активный поток
+        if (session.sessionData?.flow && session.sessionData?.step) {
+          logger.info('User in active flow, processing with ConversationManager');
+          return await this.conversationManager.handleCurrentFlow(session, message.text, clinic);
+        }
+        return await this.handleFallback(session, message.text);
+      
+      default:
+        // ИСПРАВЛЕНО: Проверяем активный поток для любых других intent
+        if (session.sessionData?.flow && session.sessionData?.step) {
+          return await this.conversationManager.handleCurrentFlow(session, message.text, clinic);
+        }
+        return await this.handleFallback(session, message.text);
+    }
+  } catch (error) {
+    logger.error('Error handling intent:', error);
+    return this.createErrorResponse('Не удалось обработать ваш запрос. Попробуйте еще раз.');
   }
+}
 
   private async handleGreeting(session: ChatSession, clinic: Clinic): Promise<BotResponse> {
     try {
+      logger.info('Handling greeting', { sessionId: session.id });
+      
       const patient = await this.db.queryOne<Patient>(`
         SELECT * FROM patients WHERE id = $1
       `, [session.patientId]);
@@ -372,15 +581,54 @@ export class BotEngine {
     }
   }
 
-  private async handleInfoRequest(session: ChatSession, intent: Intent, clinic: Clinic): Promise<BotResponse> {
+  private async handleInfoRequest(session: ChatSession, intent: Intent, clinic: Clinic, message: IncomingMessage): Promise<BotResponse> {
     try {
-      return {
-        type: 'text',
-        text: `🏥 Клиника: ${clinic.name}\n` +
-              `📍 Адрес: ${clinic.address || 'Не указан'}\n` +
-              `📞 Телефон: ${clinic.phone || 'Не указан'}\n\n` +
-              `Мы работаем для вашего здоровья!`
-      };
+      const buttonValue = message.buttonData || message.text;
+      
+      switch (buttonValue) {
+        case 'clinic_info':
+          return {
+            type: 'text',
+            text: `🏥 Клиника: ${clinic.name}\n` +
+                  `📍 Адрес: ${clinic.address || 'Не указан'}\n` +
+                  `📞 Телефон: ${clinic.phone || 'Не указан'}\n\n` +
+                  `Мы работаем для вашего здоровья!`
+          };
+        
+        case 'services_info':
+          return {
+            type: 'text',
+            text: `🦷 Наши услуги:\n\n` +
+                  `• Консультация стоматолога\n` +
+                  `• Профессиональная чистка зубов\n` +
+                  `• Лечение кариеса\n` +
+                  `• Протезирование\n` +
+                  `• Имплантация\n` +
+                  `• Ортодонтия\n\n` +
+                  `Для записи нажмите "Записаться на прием"`
+          };
+        
+        case 'contact_info':
+          return {
+            type: 'text',
+            text: `📞 Контакты:\n\n` +
+                  `Телефон: ${clinic.phone || '+7 (701) 234-56-78'}\n` +
+                  `Адрес: ${clinic.address || 'г. Алматы, ул. Абая, 123'}\n\n` +
+                  `📅 Режим работы:\n` +
+                  `Пн-Пт: 09:00 - 18:00\n` +
+                  `Сб: 10:00 - 16:00\n` +
+                  `Вс: выходной`
+          };
+        
+        default:
+          return {
+            type: 'text',
+            text: `🏥 Клиника: ${clinic.name}\n` +
+                  `📍 Адрес: ${clinic.address || 'Не указан'}\n` +
+                  `📞 Телефон: ${clinic.phone || 'Не указан'}\n\n` +
+                  `Мы работаем для вашего здоровья!`
+          };
+      }
     } catch (error) {
       logger.error('Error in handleInfoRequest:', error);
       return this.createErrorResponse('Ошибка при загрузке информации о клинике.');
@@ -408,12 +656,16 @@ export class BotEngine {
 
   private async handleFallback(session: ChatSession, text: string): Promise<BotResponse> {
     try {
+      // ИСПРАВЛЕНО: Убеждаемся что sessionData существует
+      if (!session.sessionData || typeof session.sessionData !== 'object') {
+        session.sessionData = this.createDefaultSessionData();
+      }
+
       // Увеличиваем счетчик повторов
       const sessionData = session.sessionData;
       sessionData.retryCount = (sessionData.retryCount || 0) + 1;
 
       if (sessionData.retryCount > 3) {
-        // Если слишком много неудачных попыток, переводим в режим человека
         return {
           type: 'text',
           text: '😔 Извините, я не могу понять ваш запрос. Сейчас я переведу вас на нашего администратора.'
@@ -443,11 +695,16 @@ export class BotEngine {
     response: BotResponse
   ): Promise<void> {
     try {
+      // ИСПРАВЛЕНО: Убеждаемся что sessionData существует
+      if (!session.sessionData || typeof session.sessionData !== 'object') {
+        session.sessionData = this.createDefaultSessionData();
+      }
+
       const updatedContext: ExtendedConversationContext = {
         ...session.sessionData,
         lastIntent: intent.name,
         lastResponse: response.type,
-        step: response.nextStep || session.sessionData.step,
+        step: response.nextStep || session.sessionData.step || '',
         data: {
           ...session.sessionData.data,
           lastMessageTime: new Date()
@@ -459,6 +716,10 @@ export class BotEngine {
         SET session_data = $1, last_activity = NOW()
         WHERE id = $2
       `, [JSON.stringify(updatedContext), session.id]);
+      
+      // Обновляем сессию в памяти
+      session.sessionData = updatedContext;
+      
     } catch (error) {
       logger.error('Error updating session:', error);
       // Не выбрасываем ошибку, чтобы не прерывать основной поток

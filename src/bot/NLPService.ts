@@ -66,9 +66,12 @@ export class NLPService {
   ): Promise<Intent> {
     const normalizedText = this.normalizeText(text);
     
+    // ИСПРАВЛЕНО: Проверяем что context существует и имеет нужные поля
+    const safeContext = this.ensureValidContext(context);
+    
     // Если находимся в потоке, анализируем контекст
-    if (context.flow && context.step) {
-      return this.analyzeInFlow(normalizedText, context);
+    if (safeContext.flow && safeContext.step) {
+      return this.analyzeInFlow(normalizedText, safeContext);
     }
 
     // Определяем намерение по паттернам
@@ -81,7 +84,7 @@ export class NLPService {
             name: intentName,
             confidence: 0.9, // Высокая уверенность для точных совпадений
             entities,
-            context
+            context: safeContext
           };
         }
       }
@@ -92,7 +95,29 @@ export class NLPService {
       name: 'UNKNOWN',
       confidence: 0.1,
       entities: this.extractEntities(normalizedText),
-      context
+      context: safeContext
+    };
+  }
+
+  // ДОБАВЛЕНО: Метод для обеспечения валидного контекста
+  private ensureValidContext(context: ConversationContext | any): ConversationContext {
+    if (!context || typeof context !== 'object') {
+      logger.warn('Invalid context provided, using default');
+      return {
+        flow: '',
+        step: '',
+        data: {},
+        retryCount: 0,
+        startTime: new Date()
+      };
+    }
+
+    return {
+      flow: context.flow || '',
+      step: context.step || '',
+      data: context.data || {},
+      retryCount: context.retryCount || 0,
+      startTime: context.startTime ? new Date(context.startTime) : new Date()
     };
   }
 
