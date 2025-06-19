@@ -10,6 +10,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - JWT_SECRET=your-super-secret-jwt-key-for-development
       - API_KEY=dental-bot-api-key-123456789
+      - TELEGRAM_BOT_TOKEN=7846860677:AAHwiQZssXpWiFWi4WZxAwLnM0WuaTA6Y6s
     depends_on:
       - db
       - redis
