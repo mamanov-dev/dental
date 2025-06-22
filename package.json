@@ -19,7 +19,8 @@
     "db:migrate": "node scripts/migrate.js",
     "db:seed": "node scripts/seed.js",
     "docker:dev": "docker-compose up -d",
-    "docker:prod": "docker-compose -f docker-compose.prod.yml up -d"
+    "docker:prod": "docker-compose -f docker-compose.prod.yml up -d",
+    "fix:duplicates": "cross-env AUTO_FIX=true node scripts/fix-duplicates.js"
   },
   "keywords": [],
   "author": "",
@@ -53,6 +54,7 @@
     "redis": "^5.5.6",
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",
+    "twilio": "^5.7.1",
     "typescript": "^5.8.3",
     "whatsapp-web.js": "^1.30.0",
     "winston": "^3.17.0"
@@ -65,6 +67,7 @@
     "@types/supertest": "^6.0.3",
     "@typescript-eslint/eslint-plugin": "^8.34.1",
     "@typescript-eslint/parser": "^8.34.1",
+    "cross-env": "^7.0.3",
     "eslint": "^9.29.0",
     "eslint-config-prettier": "^10.1.5",
     "eslint-plugin-prettier": "^5.5.0",

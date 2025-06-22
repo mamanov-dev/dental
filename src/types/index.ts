@@ -130,6 +130,8 @@ export interface Intent {
   confidence: number;
   entities: Entity[];
   context: ConversationContext;
+  chatGPTResponse?: string;    // ДОБАВЛЕНО: ответ от ChatGPT
+  shouldUseBuiltIn?: boolean;  // ДОБАВЛЕНО: использовать ли встроенную логику
 }
 
 export interface Entity {

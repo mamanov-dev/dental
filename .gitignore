@@ -8,6 +8,8 @@ yarn-error.log*
 .env
 .env.local
 .env.production
+docker-compose.yml
+
 
 # Build
 dist/

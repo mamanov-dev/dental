@@ -69,6 +69,7 @@ export class ConversationManager {
     };
   }
 
+  // ОБНОВЛЕНО: initializeFlows с добавленным потоком отмены
   private initializeFlows(): void {
     // Поток записи на прием
     const bookingFlow: ConversationFlow = {
@@ -124,7 +125,26 @@ export class ConversationManager {
       ]
     };
 
+    // ДОБАВЛЕНО: Поток отмены записи
+    const cancellationFlow: ConversationFlow = {
+      id: 'CANCELLATION',
+      name: 'Отмена записи',
+      steps: [
+        {
+          id: 'SELECT_APPOINTMENT',
+          message: 'Выберите запись для отмены',
+          type: 'selection'
+        },
+        {
+          id: 'CONFIRM_CANCELLATION',
+          message: 'Подтвердите отмену',
+          type: 'confirmation'
+        }
+      ]
+    };
+
     this.flows.set('BOOKING', bookingFlow);
+    this.flows.set('CANCELLATION', cancellationFlow); // ДОБАВЛЕНО
   }
 
   async handleBookingFlow(session: ChatSession, intent: Intent, clinic: Clinic): Promise<BotResponse> {
@@ -163,6 +183,44 @@ export class ConversationManager {
     }
   }
 
+  // ДОБАВЛЕНО: метод handleCancellationFlow
+  async handleCancellationFlow(session: ChatSession, intent: Intent, clinic: Clinic): Promise<BotResponse> {
+    try {
+      // Проверяем и создаем sessionData если нужно
+      if (!session.sessionData || typeof session.sessionData !== 'object') {
+        session.sessionData = this.createDefaultContext();
+        logger.warn('Created default session data for cancellation flow');
+      }
+
+      const context = session.sessionData;
+      
+      // Инициализируем поток отмены
+      context.flow = 'CANCELLATION';
+      context.step = 'SELECT_APPOINTMENT';
+      context.data = context.data || {};
+
+      logger.info('Starting cancellation flow', { 
+        sessionId: session.id, 
+        flow: context.flow, 
+        step: context.step 
+      });
+
+      // Сохраняем обновленный контекст в БД сразу
+      await this.db.query(`
+        UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+      `, [JSON.stringify(context), session.id]);
+
+      return this.executeCancellationStep(session, 'SELECT_APPOINTMENT', clinic);
+    } catch (error) {
+      logger.error('Error in handleCancellationFlow:', error);
+      return {
+        type: 'text',
+        text: '❌ Произошла ошибка при загрузке списка записей. Попробуйте снова.'
+      };
+    }
+  }
+
+  // ОБНОВЛЕНО: handleCurrentFlow с добавленной обработкой отмены
   async handleCurrentFlow(session: ChatSession, userInput: string, clinic: Clinic): Promise<BotResponse> {
     try {
       // Проверяем и создаем sessionData если нужно
@@ -182,6 +240,12 @@ export class ConversationManager {
         };
       }
 
+      // ДОБАВЛЕНО: Обработка потока отмены
+      if (context.flow === 'CANCELLATION') {
+        return this.handleCancellationFlowStep(session, userInput, clinic);
+      }
+
+      // Существующая логика для потока BOOKING
       const flow = this.flows.get(context.flow);
       if (!flow) {
         logger.error('Flow not found:', context.flow);
@@ -214,7 +278,7 @@ export class ConversationManager {
         };
       }
 
-      // Специальная обработка для шага подтверждения
+      // Специальная обработка для шага подтверждения записи
       if (context.step === 'CONFIRMATION') {
         logger.info('Processing confirmation step', { userInput });
         
@@ -270,6 +334,307 @@ export class ConversationManager {
       return {
         type: 'text',
         text: '❌ Произошла ошибка. Попробуйте снова.'
+      };
+    }
+  }
+
+  // ДОБАВЛЕНО: метод executeCancellationStep
+  private async executeCancellationStep(session: ChatSession, stepId: string, clinic: Clinic): Promise<BotResponse> {
+    try {
+      const context = session.sessionData;
+      
+      // Обновляем текущий шаг
+      context.step = stepId;
+      
+      // Сохраняем в БД
+      await this.db.query(`
+        UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+      `, [JSON.stringify(context), session.id]);
+
+      logger.info('Executing cancellation step:', { 
+        stepId, 
+        sessionId: session.id 
+      });
+
+      switch (stepId) {
+        case 'SELECT_APPOINTMENT':
+          return await this.showAppointmentsForCancellation(session, clinic);
+        
+        case 'CONFIRM_CANCELLATION':
+          return this.generateCancellationConfirmation(context, clinic);
+        
+        default:
+          return {
+            type: 'text',
+            text: 'Произошла ошибка. Начните сначала.'
+          };
+      }
+    } catch (error) {
+      logger.error('Error executing cancellation step:', error);
+      return {
+        type: 'text',
+        text: '❌ Произошла ошибка. Попробуйте снова.'
+      };
+    }
+  }
+
+  // ДОБАВЛЕНО: метод showAppointmentsForCancellation
+  private async showAppointmentsForCancellation(session: ChatSession, clinic: Clinic): Promise<BotResponse> {
+    try {
+      // Ищем активные записи пациента
+      const appointments = await this.db.query<any>(`
+        SELECT 
+          a.id,
+          a.appointment_date,
+          a.service_type,
+          d.name as doctor_name 
+        FROM appointments a
+        JOIN doctors d ON a.doctor_id = d.id
+        WHERE a.patient_id = $1 
+        AND a.status IN ('scheduled', 'confirmed')
+        AND a.appointment_date > NOW()
+        ORDER BY a.appointment_date
+      `, [session.patientId]);
+
+      if (appointments.rows.length === 0) {
+        // Сбрасываем поток если нет записей
+        const context = session.sessionData;
+        context.flow = '';
+        context.step = '';
+        context.data = {};
+
+        await this.db.query(`
+          UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+        `, [JSON.stringify(context), session.id]);
+
+        return {
+          type: 'text',
+          text: '📅 У вас нет активных записей для отмены.\n\nМожете записаться на новый прием, написав "привет".'
+        };
+      }
+
+      const options: ResponseOption[] = appointments.rows.map((apt: any) => {
+        const appointmentDate = new Date(apt.appointment_date);
+        const formattedDate = new Intl.DateTimeFormat('ru-RU', {
+          weekday: 'short',
+          day: '2-digit',
+          month: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit'
+        }).format(appointmentDate);
+
+        return {
+          id: apt.id.toString(),
+          text: `${formattedDate} - ${apt.doctor_name}`,
+          value: apt.id.toString(),
+          description: apt.service_type
+        };
+      });
+
+      // Добавляем кнопку отмены
+      options.push({
+        id: 'back',
+        text: '🔙 Назад в главное меню',
+        value: 'back_to_menu'
+      });
+
+      return {
+        type: 'list',
+        text: '📋 Ваши активные записи:\n\nВыберите запись для отмены:',
+        options
+      };
+    } catch (error) {
+      logger.error('Error showing appointments for cancellation:', error);
+      return {
+        type: 'text',
+        text: '❌ Ошибка при загрузке списка записей.'
+      };
+    }
+  }
+
+  // ДОБАВЛЕНО: метод generateCancellationConfirmation
+  private generateCancellationConfirmation(context: any, clinic: Clinic): BotResponse {
+    const data = context.data;
+    const { selectedAppointment } = data;
+    
+    return {
+      type: 'keyboard',
+      text: `❌ Подтвердите отмену записи:\n\n` +
+            `📋 Запись: ${selectedAppointment?.displayText || 'Не указана'}\n` +
+            `🏥 Клиника: ${clinic.name}\n\n` +
+            `⚠️ Отменить эту запись?`,
+      options: [
+        { id: 'confirm_cancel', text: '✅ Да, отменить', value: 'confirm_cancel' },
+        { id: 'keep', text: '❌ Нет, оставить', value: 'keep_appointment' }
+      ],
+      nextStep: 'CONFIRM_CANCELLATION'
+    };
+  }
+
+  // ДОБАВЛЕНО: метод handleCancellationFlowStep
+  private async handleCancellationFlowStep(session: ChatSession, userInput: string, clinic: Clinic): Promise<BotResponse> {
+    try {
+      const context = session.sessionData;
+      
+      logger.info('Processing cancellation flow step', { 
+        step: context.step, 
+        userInput, 
+        sessionId: session.id 
+      });
+
+      switch (context.step) {
+        case 'SELECT_APPOINTMENT':
+          if (userInput === 'back_to_menu') {
+            // Возвращаемся в главное меню
+            context.flow = '';
+            context.step = '';
+            context.data = {};
+
+            await this.db.query(`
+              UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+            `, [JSON.stringify(context), session.id]);
+
+            return {
+              type: 'text',
+              text: 'Вы вернулись в главное меню. Напишите "привет" для продолжения.'
+            };
+          }
+
+          // Сохраняем выбранную запись
+          const appointmentId = parseInt(userInput);
+          if (isNaN(appointmentId)) {
+            return {
+              type: 'text',
+              text: 'Пожалуйста, выберите запись из списка.'
+            };
+          }
+
+          // Получаем детали записи
+          const appointment = await this.db.queryOne<any>(`
+            SELECT 
+              a.id,
+              a.appointment_date,
+              a.service_type,
+              d.name as doctor_name 
+            FROM appointments a
+            JOIN doctors d ON a.doctor_id = d.id
+            WHERE a.id = $1 AND a.patient_id = $2
+          `, [appointmentId, session.patientId]);
+
+          if (!appointment) {
+            return {
+              type: 'text',
+              text: 'Запись не найдена. Попробуйте выбрать из списка.'
+            };
+          }
+
+          // Сохраняем данные о выбранной записи
+          context.data = {
+            selectedAppointmentId: appointmentId,
+            selectedAppointment: {
+              id: appointment.id,
+              displayText: `${this.formatDate(appointment.appointment_date)} - ${appointment.doctor_name} (${appointment.service_type})`
+            }
+          };
+          context.step = 'CONFIRM_CANCELLATION';
+
+          await this.db.query(`
+            UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+          `, [JSON.stringify(context), session.id]);
+
+          return this.generateCancellationConfirmation(context, clinic);
+
+        case 'CONFIRM_CANCELLATION':
+          if (userInput === 'confirm_cancel') {
+            return this.completeCancellation(session, clinic);
+          } else if (userInput === 'keep_appointment') {
+            // Сбрасываем поток и возвращаемся в меню
+            context.flow = '';
+            context.step = '';
+            context.data = {};
+
+            await this.db.query(`
+              UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+            `, [JSON.stringify(context), session.id]);
+
+            return {
+              type: 'text',
+              text: '✅ Запись сохранена. Ждем вас в назначенное время!\n\nНапишите "привет" для возврата в главное меню.'
+            };
+          } else {
+            return {
+              type: 'text',
+              text: 'Пожалуйста, выберите "Да, отменить" или "Нет, оставить".'
+            };
+          }
+
+        default:
+          return {
+            type: 'text',
+            text: 'Произошла ошибка в процессе отмены. Попробуйте снова.'
+          };
+      }
+    } catch (error) {
+      logger.error('Error in handleCancellationFlowStep:', error);
+      return {
+        type: 'text',
+        text: '❌ Произошла ошибка при отмене записи.'
+      };
+    }
+  }
+
+  // ДОБАВЛЕНО: метод completeCancellation
+  private async completeCancellation(session: ChatSession, clinic: Clinic): Promise<BotResponse> {
+    try {
+      const context = session.sessionData;
+      const data = context.data;
+      const appointmentId = data.selectedAppointmentId;
+
+      logger.info('Completing cancellation', { 
+        appointmentId, 
+        sessionId: session.id 
+      });
+
+      // Отменяем запись в БД
+      const result = await this.db.query<any>(`
+        UPDATE appointments 
+        SET status = 'cancelled', updated_at = NOW()
+        WHERE id = $1 AND patient_id = $2
+        RETURNING id, appointment_date, service_type
+      `, [appointmentId, session.patientId]);
+
+      if (result.rows.length === 0) {
+        return {
+          type: 'text',
+          text: '❌ Не удалось отменить запись. Возможно, она уже была отменена.'
+        };
+      }
+
+      const cancelledAppointment = result.rows[0];
+
+      // Сбрасываем контекст сессии
+      context.flow = '';
+      context.step = '';
+      context.data = {};
+
+      await this.db.query(`
+        UPDATE chat_sessions SET session_data = $1 WHERE id = $2
+      `, [JSON.stringify(context), session.id]);
+
+      return {
+        type: 'text',
+        text: `✅ Запись успешно отменена!\n\n` +
+              `📋 Номер записи: ${cancelledAppointment.id}\n` +
+              `📅 Дата: ${this.formatDate(cancelledAppointment.appointment_date)}\n` +
+              `🦷 Услуга: ${cancelledAppointment.service_type}\n\n` +
+              `Если захотите записаться снова, напишите "привет".`
+      };
+
+    } catch (error) {
+      logger.error('Error completing cancellation:', error);
+      return {
+        type: 'text',
+        text: '❌ Произошла ошибка при отмене записи. Попробуйте снова или обратитесь в клинику.'
       };
     }
   }
@@ -682,5 +1047,23 @@ export class ConversationManager {
       day: '2-digit',
       month: '2-digit'
     }).format(date);
+  }
+
+  // ДОБАВЛЕНО: вспомогательный метод formatDate
+  private formatDate(date: Date | string): string {
+    try {
+      const dateObj = typeof date === 'string' ? new Date(date) : date;
+      return new Intl.DateTimeFormat('ru-RU', {
+        weekday: 'long',
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      }).format(dateObj);
+    } catch (error) {
+      logger.error('Error formatting date:', error);
+      return 'Дата не указана';
+    }
   }
 }
